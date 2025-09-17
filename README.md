@@ -29,7 +29,7 @@ AquaFeat is different. It's a feature-level enhancement network that integrates 
 
 ### Architecture Overview
 
-![AquaFeat architecture overview](httpsD-4.jpg)
+![AquaFeat architecture overview](AquaFeat\Figures\Architecture.png)
 *Fig. 1: Overview of the AquaFeat architecture.*
 
 The model works in three main stages:
@@ -51,7 +51,7 @@ AquaFeat (integrated with YOLOv8m) achieves state-of-the-art Precision and Recal
 
 ### Qualitative Comparison
 
-![Qualitative detection comparison from Figure 2](httpsG-5.jpg)
+![Qualitative detection comparison from Figure 2](AquaFeat\Figures\Comparison.png)
 *Fig. 2: Qualitative object detection comparison. As shown above (e.g., last column), AquaFeat can correctly detect objects in complex, low-visibility scenarios where other methods fail.*
 
 ---
