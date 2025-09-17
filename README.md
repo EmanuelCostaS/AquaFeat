@@ -2,7 +2,7 @@
 
 [![Paper: arXiv](https://img.shields.io/badge/paper-arXiv-b31b1b.svg)](https://arxiv.org/abs/YOUR_PAPER_LINK_HERE)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub Stars](https://img.shields.io/github/stars/YOUR_USERNAME/YOUR_REPO?style=social)](https://github.com/YOUR_USERNAME/YOUR_REPO)
+[![GitHub Stars](https://img.shields.io/github/stars/YOUR_USERNAME/YOUR_REPO?style=social)](https://github.com/EmanuelCostaS/AquaFeat)
 
 This is the official implementation of the paper: **"AquaFeat: A Features-Based Image Enhancement Model for Underwater Object Detection"**.
 
