@@ -89,11 +89,6 @@ We created a processed, image-based version of the FishTrack23 dataset by sampli
 
 ## Usage
 
-### Pre-trained Models
-
-Download our pre-trained AquaFeat+YOLOv8m weights:
-**[Link to your .pt file on GitHub Releases or Google Drive]**
-
 ### Inference
 
 Run inference on an image or video:
