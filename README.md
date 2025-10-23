@@ -2,7 +2,6 @@
 
 [![Paper: arXiv](https://img.shields.io/badge/paper-arXiv-b31b1b.svg)](https://arxiv.org/abs/YOUR_PAPER_LINK_HERE)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub Stars](https://img.shields.io/github/stars/YOUR_USERNAME/YOUR_REPO?style=social)](https://github.com/EmanuelCostaS/AquaFeat)
 
 This is the official implementation of the paper: **"AquaFeat: A Features-Based Image Enhancement Model for Underwater Object Detection"**.
 
@@ -29,7 +28,7 @@ AquaFeat is different. It's a feature-level enhancement network that integrates 
 
 ### Architecture Overview
 
-![AquaFeat architecture overview](AquaFeat\Figures\Architecture.png)
+<img align="center" src="./Figures/Architecture.png" width=1000 />
 *Fig. 1: Overview of the AquaFeat architecture.*
 
 The model works in three main stages:
@@ -51,7 +50,9 @@ AquaFeat (integrated with YOLOv8m) achieves state-of-the-art Precision and Recal
 
 ### Qualitative Comparison
 
-![Qualitative detection comparison from Figure 2](AquaFeat\Figures\Comparison.png)
+<div align="center">
+  <img src="./Figures/Comparison.png" width=750 />
+</div>
 *Fig. 2: Qualitative object detection comparison. As shown above (e.g., last column), AquaFeat can correctly detect objects in complex, low-visibility scenarios where other methods fail.*
 
 ---
@@ -82,7 +83,7 @@ Our model was trained and evaluated using the following datasets:
 * **Fine-tuning & Evaluation:** [FishTrack23](https://www.lirmm.fr/fishtrack/).
 
 We created a processed, image-based version of the FishTrack23 dataset by sampling one annotated frame every 30 frames, resulting in 6,392 images.
-**[[Link to download our processed FishTrack23 annotations and image lists](https://huggingface.co/datasets/TatiSchein/AquaFeat/tree/main)]**
+**[[Link to download our processed FishTrack23 annotations and image lists](https://huggingface.co/datasets/PDI-DL/AquaFeat)]**
 
 ---
 
@@ -101,3 +102,30 @@ python detect.py \
     --weights /path/to/aquafeat_yolov8m.pt \
     --source /path/to/your/image_or_video.mp4 \
     --conf 0.25
+```
+
+### Citation
+
+If you find our work useful in your research, please consider citing our paper:
+```BIBTEX
+@inproceedings{Silva2025AquaFeat_unpub,
+    author = {Silva, Emanuel da Costa and Schein, Tatiana Taís and 
+              Brião, Stephanie Loi and Costa, Guilherme Louro Mano and 
+              Oliveira, Felipe Gomes and Almeida, Gustavo Pereira and 
+              Silva, Eduardo Lawson and Devincenzi, Sam da Silva and 
+              Machado, Karina dos Santos and Drews-Jr, Paulo Lilles Jorge},
+    affiliation = {Universidade Federal do Rio Grande and 
+                   Universidade Federal do Rio Grande and 
+                   Universidade Federal do Rio Grande and 
+                   Universidade Federal do Rio Grande and 
+                   Universidade Federal do Amazonas and 
+                   Universidade Federal do Rio Grande and 
+                   Universidade Federal do Rio Grande and 
+                   Universidade Federal do Rio Grande and 
+                   Universidade Federal do Rio Grande and 
+                   Universidade Federal do Rio Grande},
+    title = {AquaFeat: A features-based image enhancement model for underwater object detection},
+    booktitle = {SIBGRAPI},
+    year = {2025}
+}
+```
