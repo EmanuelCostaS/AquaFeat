@@ -1,0 +1,418 @@
+"""
+AquaFeat+ official implementation alongside YOLOv11
+"""
+
+import os
+import yaml
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from ultralytics import YOLO
+from ultralytics.nn import tasks
+from collections import OrderedDict
+
+# ===================================================================
+# PART 1: DEFINE THE CUSTOM MODULES
+# ===================================================================
+
+class SpecialConv(nn.Module):
+    """
+    Implementation of the Special Convolutional Layer from the MSDC-Net paper.
+    This layer enhances the contrast adjustment and color correction abilities
+    of a standard convolution by using channel-wise statistics (mean and std)
+    to create adaptive feature multipliers.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=1, bias=True):
+        super(SpecialConv, self).__init__()
+        
+        # Main convolutional branch
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=bias)
+
+        # Adaptive branches based on channel statistics
+        # Branch 1: Uses mean only
+        self.attn_mean = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, 1, 0),  # CORRECTED: Projects to out_channels
+            nn.Sigmoid()
+        )
+        # Branch 2: Uses concatenated mean and standard deviation
+        self.attn_mean_std = nn.Sequential(
+            nn.Conv2d(in_channels * 2, out_channels, 1, 1, 0), # CORRECTED: Projects to out_channels
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # Main convolution
+        features = self.conv(x)
+        
+        # --- Adaptive Statistics Calculation ---
+        with torch.no_grad():
+            b, c, h, w = x.shape
+            mean = torch.mean(x.view(b, c, -1), dim=2).view(b, c, 1, 1)
+            std = torch.std(x.view(b, c, -1), dim=2).view(b, c, 1, 1)
+
+        # --- Adaptive Attention Generation ---
+        attn1 = self.attn_mean(mean)
+        
+        mean_std_cat = torch.cat([mean, std], dim=1)
+        attn2 = self.attn_mean_std(mean_std_cat)
+
+        # Apply the adaptive weights. Now the shapes will match:
+        # features: [B, out_channels, H, W]
+        # attn1:    [B, out_channels, 1, 1]
+        # attn2:    [B, out_channels, 1, 1]
+        enhanced_features = features * attn1 * attn2
+        
+        return enhanced_features
+
+class ColorCorrectionBlock(nn.Module):
+    """
+    A deterministic color correction block inspired by Algorithm 1 in MSDC-Net.
+    This is not a trainable layer but a pre-processing step to standardize color distributions.
+    It is designed to run on the GPU with the rest of the model.
+    """
+    def __init__(self):
+        super().__init__()
+
+    @torch.no_grad() # This operation does not require gradients
+    def forward(self, x):
+        # x is a batch of images of shape (B, C, H, W), normalized to [0, 1]
+        x_out = []
+        # Process each image in the batch individually
+        for img in x:
+            # Split channels
+            r, g, b = img[0], img[1], img[2]
+            
+            # Calculate mean of each channel
+            means = {'r': torch.mean(r), 'g': torch.mean(g), 'b': torch.mean(b)}
+            
+            # Sort means to find the channel with the lowest, middle, and highest mean value
+            sorted_means = sorted(means.items(), key=lambda item: item[1])
+            ch_low, mu_low = sorted_means[0]
+            ch_mid, mu_mid = sorted_means[1]
+            ch_high, mu_high = sorted_means[2]
+            
+            # Create a dictionary to hold the adjusted channels
+            adjusted_channels = {}
+            
+            # Apply the color shift based on the algorithm from the paper
+            # Compensate the most absorbed color, and limit the least absorbed one.
+            for ch_name, ch_tensor in {'r': r, 'g': g, 'b': b}.items():
+                if ch_name == ch_low:
+                    adjusted_channels[ch_name] = ch_tensor + (mu_mid - mu_low)
+                elif ch_name == ch_high:
+                    adjusted_channels[ch_name] = ch_tensor - (mu_high - mu_mid)
+                else: # Middle channel remains unchanged as the pivot
+                    adjusted_channels[ch_name] = ch_tensor
+            
+            # Recombine channels and clamp values to the valid [0, 1] range
+            corrected_img = torch.stack([
+                torch.clamp(adjusted_channels['r'], 0, 1),
+                torch.clamp(adjusted_channels['g'], 0, 1),
+                torch.clamp(adjusted_channels['b'], 0, 1)
+            ], dim=0)
+            x_out.append(corrected_img)
+
+        # Stack the individually processed images back into a single batch tensor
+        return torch.stack(x_out, dim=0)
+
+class GlobalScaleAttentionModule(nn.Module):
+    """
+    Global Scale-Attention Module (GSAM): a unified module combining the
+    Scale-Aware Feature Aggregation (SAFA) and the Global Feature-Aware (GFA)
+    module inspired by the FAD-CSP from the AMSP-UOD paper.
+    This module enhances features by considering both multi-scale and global context.
+    """
+    def __init__(self, channels):
+        super().__init__()
+        # --- Multi-Scale Aggregation Layers (from SAFA) ---
+        self.mult_scale_heads = 8
+        self.query_conv1 = nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=7, stride=4)
+        self.query_conv2 = nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, stride=2)
+        self.key_conv = nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, stride=2)
+
+        # --- Global Feature-Aware (GFA) Module Layers ---
+        # The paper uses both AvgPool and MaxPool, which is more robust
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        
+        # Convolution to process the concatenated pooled features
+        # This allows horizontal and vertical context to interact.
+        self.context_processor = nn.Sequential(
+            nn.Conv2d(channels, channels // 8, 1, padding=0, bias=False),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Convolutions to generate the final attention maps for height and width
+        self.conv_h = nn.Conv2d(channels // 8, channels, 1, bias=False)
+        self.conv_w = nn.Conv2d(channels // 8, channels, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, quarter_scale_x):
+        # Keep a reference to the original input for the final residual connection
+        orig_x = x 
+        
+        # ===================================================================
+        # 1. Global Feature-Aware (GFA) Module Logic
+        # ===================================================================
+        
+        # --- Capture long-range context with strip pooling ---
+        # The paper uses both average and max pooling.
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2) # Permute to make width the spatial dimension
+
+        # --- Fuse and process the context vectors ---
+        # Concatenate along the spatial dimension and process
+        hw_cat = torch.cat([x_h, x_w], dim=2)
+        processed_hw = self.context_processor(hw_cat)
+
+        # --- Split back into height and width features ---
+        # Split the processed features back to height and width representations
+        x_h_processed, x_w_processed = torch.split(processed_hw, [x_h.size(2), x_w.size(2)], dim=2)
+        x_w_processed = x_w_processed.permute(0, 1, 3, 2) # Permute back
+
+        # --- Generate and apply the global attention map ---
+        # Create the attention maps and apply sigmoid activation
+        attention_h = self.sigmoid(self.conv_h(x_h_processed))
+        attention_w = self.sigmoid(self.conv_w(x_w_processed))
+        
+        # Apply the attention map to the original features
+        global_attended_feature = orig_x * attention_w * attention_h
+
+        # ===================================================================
+        # 2. Multi-Scale Aggregation Logic (from SAFA)
+        # ===================================================================
+        
+        x_q = self.query_conv1(x)
+        x_q = self.query_conv2(x_q)
+        x_k = self.key_conv(quarter_scale_x)
+        batch_size, C, roi_h, roi_w = x_q.size()
+        x_cat = torch.cat((
+            x_q.view(batch_size, 1, C, roi_h, roi_w), 
+            x_k.view(batch_size, 1, C, roi_h, roi_w)
+        ), dim=1)
+        
+        # Multi-head attention logic
+        batch_size, img_n, _, roi_h, roi_w = x_cat.size()
+        x_embed = x_cat.view(batch_size, img_n, self.mult_scale_heads, -1, roi_h, roi_w)
+        target_x_embed = x_embed[:, [1]] # Use quarter_scale features as the target
+        ada_weights = (x_embed * target_x_embed).sum(dim=3, keepdim=True) / ((C / self.mult_scale_heads)**0.5)
+        ada_weights = ada_weights.expand(-1, -1, -1, int(C / self.mult_scale_heads), -1, -1).contiguous()
+        ada_weights = ada_weights.view(batch_size, img_n, C, roi_h, roi_w).softmax(dim=1)
+        
+        # Weighted sum of features from different scales
+        aggregated_feature = (x_cat * ada_weights).sum(dim=1)
+        aggregated_feature = F.interpolate(aggregated_feature, size=orig_x.shape[-2:], mode='bilinear', align_corners=False)
+        
+        # ===================================================================
+        # 3. Final Combined Representation
+        # ===================================================================
+        
+        # Combine the three feature streams:
+        # a) The original features (main skip connection)
+        # b) The multi-scale aggregated features (SAFA)
+        # c) The globally-aware features (GFA)
+        aggregated_enhanced_representation = orig_x + aggregated_feature + global_attended_feature
+        
+        return aggregated_enhanced_representation
+
+class AquaFeat+(nn.Module):
+    def __init__(self, in_channels=3):
+        super(AquaFeat+, self).__init__()
+        int_out_channels = 32
+        out_channels = 24  # Used for intermediate features
+        self.relu = nn.ReLU(inplace=True)
+        
+        # Instantiate the Color Correction Block
+        self.color_corrector = ColorCorrectionBlock()
+
+        # --- Layer Definitions with SpecialConv ---
+        # We replace the first and last convolutions with our new SpecialConv.
+        # The other layers remain as standard nn.Conv2d for efficiency.
+        
+        # Use SpecialConv for the first layer to adapt to the input
+        self.e_conv1 = SpecialConv(in_channels, int_out_channels, 3, 1, 1, bias=True)
+        
+        # Standard convolutions for intermediate layers
+        self.e_conv2 = nn.Conv2d(int_out_channels, int_out_channels, 3, 1, 1, bias=True)
+        self.e_conv3 = nn.Conv2d(int_out_channels, int_out_channels, 3, 1, 1, bias=True)
+        self.e_conv4 = nn.Conv2d(int_out_channels, int_out_channels, 3, 1, 1, bias=True)
+        self.e_conv5 = nn.Conv2d(int_out_channels * 2, int_out_channels, 3, 1, 1, bias=True)
+        self.e_conv6 = nn.Conv2d(int_out_channels * 2, int_out_channels, 3, 1, 1, bias=True)
+        self.e_conv7 = nn.Conv2d(int_out_channels * 2, out_channels, 3, 1, 1, bias=True)
+        self.ue_conv8 = nn.Conv2d(out_channels * 2, int_out_channels, 3, 1, 1, bias=True)
+
+        # Use SpecialConv for the final layer to produce an adaptive residual
+        self.ue_conv9 = SpecialConv(int_out_channels, 3, 3, 1, 1, bias=True)
+
+        # The rest of the original AquaFeat+ layers are unchanged
+        self.quarter_conv = nn.Conv2d(in_channels, in_channels, 7, 4)
+        self.hexa_conv = nn.Conv2d(in_channels, in_channels, 3, 2)
+        self.gsam = GlobalScaleAttentionModule(channels=out_channels)
+
+    def forward(self, x):
+        original_x = x # Keep a reference to the original input
+
+        # Apply color correction as the very first step
+        corrected_x = self.color_corrector(x)
+
+        # Forward pass through the enhancement network using the corrected image
+        quarter_scale_x = self.quarter_conv(corrected_x); hexa_scale_x = self.hexa_conv(quarter_scale_x)
+        x1 = self.relu(self.e_conv1(corrected_x)); quarter_scale_x1 = self.relu(self.e_conv1(quarter_scale_x)); hexa_scale_x1 = self.relu(self.e_conv1(hexa_scale_x))
+        x2 = self.relu(self.e_conv2(x1)); quarter_scale_x2 = self.relu(self.e_conv2(quarter_scale_x1)); hexa_scale_x2 = self.relu(self.e_conv2(hexa_scale_x1))
+        x3 = self.relu(self.e_conv3(x2)); quarter_scale_x3 = self.relu(self.e_conv3(quarter_scale_x2)); hexa_scale_x3 = self.relu(self.e_conv3(hexa_scale_x2))
+        x4 = self.relu(self.e_conv4(x3)); quarter_scale_x4 = self.relu(self.e_conv4(quarter_scale_x3)); hexa_scale_x4 = self.relu(self.e_conv4(hexa_scale_x3))
+        x5 = self.relu(self.e_conv5(torch.cat([x3, x4], 1))); quarter_scale_x5 = self.relu(self.e_conv5(torch.cat([quarter_scale_x3, quarter_scale_x4], 1))); hexa_scale_x5 = self.relu(self.e_conv5(torch.cat([hexa_scale_x3, hexa_scale_x4], 1)))
+        x6 = self.relu(self.e_conv6(torch.cat([x2, x5], 1))); quarter_scale_x6 = self.relu(self.e_conv6(torch.cat([quarter_scale_x2, quarter_scale_x5], 1))); hexa_scale_x6 = self.relu(self.e_conv6(torch.cat([hexa_scale_x2, hexa_scale_x5], 1)))
+        x7 = self.relu(self.e_conv7(torch.cat([x1, x6], 1))); quarter_scale_x7 = self.relu(self.e_conv7(torch.cat([quarter_scale_x1, quarter_scale_x6], 1))); hexa_scale_x7 = self.e_conv7(torch.cat([hexa_scale_x1, hexa_scale_x6], 1))
+        x7 = self.gsam(x7, quarter_scale_x7)
+        hexa_scale_x7 = F.interpolate(hexa_scale_x7, size=x7.shape[-2:], mode='bilinear', align_corners=False)
+        x8 = self.ue_conv8(torch.cat([x7, hexa_scale_x7], 1))
+
+        enhancement_residual = torch.tanh(self.ue_conv9(x8))
+
+        # We return the original image with the enhancement added.
+        return torch.clamp(original_x + enhancement_residual, 0, 1)
+
+print("Custom module classes, including SpecialConv, defined and modified.")
+
+# ===================================================================
+# PART 2: INJECT THE CUSTOM MODULE
+# ===================================================================
+setattr(tasks, 'AquaFeat+', AquaFeat+)
+# No need to inject SpecialConv separately as it's part of AquaFeat+
+print("AquaFeat+ module successfully injected into Ultralytics.")
+
+# ===================================================================
+# PART 3: CREATE THE NEW MODEL YAML
+# ===================================================================
+# This YAML remains the same as your previous version. The changes are
+# internal to the AquaFeat+ module and don't affect the YAML structure.
+yaml_content = """
+nc: NC_PLACEHOLDER  # Defines number of classes at the top level
+
+# Backbone
+backbone:
+  # [from, number, module, args]
+  - [-1, 1, AquaFeat+, [3]]      # Layer 0: Custom input enhancement.
+
+  # --- Start of your "yolov11s" backbone ---
+  # The first Conv now takes input from layer 0 (your custom block)
+  - [0, 1, Conv, [64, 3, 2]]              # Layer 1
+  - [-1, 1, C2f, [128, True]]             # Layer 2
+  - [-1, 1, Conv, [128, 3, 2]]            # Layer 3
+  - [-1, 4, C2f, [256, True]]             # Layer 4 (P3 skip connection source)
+  - [-1, 1, Conv, [256, 3, 2]]            # Layer 5
+  - [-1, 4, C2f, [512, True]]             # Layer 6 (P4 skip connection source)
+  - [-1, 1, Conv, [512, 3, 2]]            # Layer 7
+  - [-1, 2, C2f, [512, True]]             # Layer 8
+  - [-1, 1, SPPF, [512, 5]]               # Layer 9 (P5 skip connection source)
+
+# Head
+head:
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']] # Layer 10
+  - [[-1, 6], 1, Concat, [1]]             # Layer 11: Concat with layer 6
+  - [-1, 2, C2f, [512]]                   # Layer 12 (P4 head)
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']] # Layer 13
+  - [[-1, 4], 1, Concat, [1]]             # Layer 14: Concat with layer 4
+  - [-1, 2, C2f, [256]]                   # Layer 15 (P3 head)
+
+  - [-1, 1, Conv, [256, 3, 2]]            # Layer 16
+  - [[-1, 12], 1, Concat, [1]]            # Layer 17: Concat with layer 12
+  - [-1, 2, C2f, [512]]                   # Layer 18 (P4 head)
+
+  - [-1, 1, Conv, [512, 3, 2]]            # Layer 19
+  - [[-1, 9], 1, Concat, [1]]             # Layer 20: Concat with layer 9
+  - [-1, 2, C2f, [512]]                   # Layer 21 (P5 head)
+
+  - [[15, 18, 21], 1, Detect, [NC_PLACEHOLDER]] # Layer 22: Detect(P3, P4, P5)
+"""
+
+# ===================================================================
+# PART 4: CUSTOM WEIGHT LOADING LOGIC
+# ===================================================================
+print("\n--- Starting Custom Weight Loading ---")
+
+og_model_path = "/home/pdi-navms1/Documentos/Emanuel/ICAR/yolo11s.pt"
+
+# 1. Load the OG model and get its number of classes (nc)
+print(f"Loading OG model from: {og_model_path}")
+og_model = YOLO(og_model_path)
+og_state_dict = og_model.state_dict()
+try:
+    nc = og_model.model.yaml['nc']
+    print(f"OG model weights loaded. Found nc={nc} classes.")
+except KeyError:
+    print("Could not find 'nc' in the model's yaml. Please check your 'best.pt' file.")
+    exit()
+
+# Dynamically insert the number of classes into the YAML string
+final_yaml_content = yaml_content.replace('NC_PLACEHOLDER', str(nc))
+
+model_yaml_filename = "yolov8m_specialconv_enhancer_transfer.yaml"
+with open(model_yaml_filename, "w") as f:
+    f.write(final_yaml_content)
+print(f"'{model_yaml_filename}' created successfully with nc={nc}.")
+
+# 2. Initialize the new custom model
+print(f"Initializing new custom model from: {model_yaml_filename}")
+custom_model = YOLO(model_yaml_filename)
+custom_state_dict = custom_model.state_dict()
+print("New custom model initialized.")
+
+# 3. Create a new state dictionary to map the weights
+new_state_dict = OrderedDict()
+print("Mapping weights from OG model to new custom model...")
+
+for k, v in og_state_dict.items():
+    key_parts = k.split('.')
+    # This logic correctly shifts layer indices for the backbone
+    if key_parts[0] == 'model' and key_parts[1].isdigit():
+        original_layer_idx = int(key_parts[1])
+        if original_layer_idx < 22: # Assuming OG model has 22 layers before Detect
+            new_layer_idx = original_layer_idx + 1 # Shift backbone/neck layers
+            key_parts[1] = str(new_layer_idx)
+            new_key = ".".join(key_parts)
+        else:
+            new_key = k # Keep head keys the same
+    else:
+        new_key = k
+
+    if new_key in custom_state_dict and custom_state_dict[new_key].shape == v.shape:
+        new_state_dict[new_key] = v
+    else:
+        print(f"  [!] Skipped {k}: Mismatch or key '{new_key}' not found in new model.")
+
+# 4. Load our carefully mapped weights into the custom model
+custom_model.load_state_dict(new_state_dict, strict=False)
+print("Weight transfer complete. Enhancement layer remains randomly initialized.")
+
+# ===================================================================
+# PART 5: START TRAINING
+# ===================================================================
+# --- IMPORTANT ---
+# You must update this path to point to the `dataset.yaml` file
+# inside the NEW balanced dataset folder you created.
+data_yaml_path = "/home/pdi-navms1/Documentos/Emanuel/FishTrack23/datasets/FINAL2/dataset.yaml"
+# ---
+
+# It's also a good idea to update the project/run name for clarity
+project_name = "AquaFeat+"
+run_name = "yolov11s_AquaFeat+"
+
+print(f"\nStarting training using data from {data_yaml_path}...")
+
+results = custom_model.train(
+    data=data_yaml_path,
+    epochs=150,
+    imgsz=608,
+    batch=8,
+    optimizer='AdamW',
+    lr0=0.0003,
+    project=project_name,
+    name=run_name,
+    exist_ok=True,
+    patience=50
+)
+
+print("Training finished.")
